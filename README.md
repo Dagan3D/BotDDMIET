@@ -31,8 +31,8 @@
 
 1.  **Клонируйте репозиторий:**
     ```bash
-    git clone [URL вашего репозитория]
-    cd [название-папки]
+    git clone https://github.com/Dagan3D/BotDDMIET.git
+    cd BotDDMIET
     ```
 
 2.  **Создайте и активируйте виртуальное окружение:**

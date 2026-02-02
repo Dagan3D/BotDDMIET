@@ -7,6 +7,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.filters.command import Command
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+from db_utils import init_db, pool
 import logging
 import asyncio
 from db_utils import (
@@ -103,8 +105,10 @@ async def process_question(message: types.Message, state: FSMContext):
     topic_key = user_data.get('topic_key')
     target_group_info = SPECIALIST_GROUPS.get(topic_key)
 
-    if not target_group_info:
-        await message.answer(MESSAGES["error_topic"])
+    if not target_group_info or not target_group_info.get('chat_id'):
+        logging.error(f"Chat ID not found for topic: {topic_key}")
+        await message.answer("Ошибка конфигурации: группа поддержки не настроена. Обратитесь к администратору.")
+        await state.clear()
         return
 
     target_chat_id = target_group_info['chat_id']
@@ -133,34 +137,43 @@ async def close_ticket(message: types.Message, state: FSMContext):
         await message.reply(MESSAGES["close_command_in_thread"])
         return
 
-    lookup_key = (message.chat.id, message.message_thread_id)
+    # 1. Получаем ID пользователя
     user_id_to_notify = await get_user_by_thread(message.chat.id, message.message_thread_id)
 
     if user_id_to_notify:
-        await remove_thread(message.chat.id, message.message_thread_id)
-        await remove_active_topic(user_id_to_notify)
-        # Уведомляем пользователя
+        notification_sent = False
+        
+        # 2. Пытаемся уведомить пользователя ПЕРЕД удалением из БД
         try:
             await bot.send_message(user_id_to_notify, MESSAGES["ticket_closed_specialist"])
+            notification_sent = True
         except TelegramBadRequest:
-            # Пользователь мог заблокировать бота
-            logging.warning(
-                f"Не удалось уведомить пользователя {user_id_to_notify} о закрытии тикета.")
+            # Пользователь заблокировал бота или удалил чат
+            logging.warning(f"Не удалось уведомить пользователя {user_id_to_notify}.")
+        except Exception as e:
+            logging.error(f"Ошибка отправки сообщения: {e}")
 
-        await message.reply("Обращение закрыто. Пользователь уведомлен.")
+        # 3. Чистим базу данных
+        await remove_thread(message.chat.id, message.message_thread_id)
+        await remove_active_topic(user_id_to_notify)
 
-        # Красивый бонус: закрываем саму тему в Telegram
+        # 4. Отправляем отчет администратору в зависимости от результата
+        if notification_sent:
+            await message.reply("✅ Обращение закрыто. Пользователь уведомлен.")
+        else:
+            await message.reply("⚠️ Обращение закрыто, но пользователь НЕ получил уведомление (бот заблокирован или недоступен).")
+
+        # 5. Закрываем саму тему в Telegram
         try:
             await bot.close_forum_topic(
-                chat_id=lookup_key[0],
-                message_thread_id=lookup_key[1]
+                chat_id=message.chat.id,
+                message_thread_id=message.message_thread_id
             )
         except TelegramBadRequest as e:
             logging.error(f"Не удалось закрыть тему: {e}")
 
     else:
         await message.reply(MESSAGES["no_user_for_thread"])
-
 
 # Обработчик ответов специалиста остается почти таким же
 @dp.message(F.chat.type.in_({'supergroup'}))
@@ -190,11 +203,39 @@ async def forward_to_specialist(message: types.Message, state: FSMContext):
         await message.answer(MESSAGES["closed_previous_ticket"])
         await state.clear()
 
+async def set_commands():
+    # Команды для личных сообщений (для пользователей)
+    private_commands = [
+        BotCommand(command="start", description="Начать обращение"),
+        BotCommand(command="stop", description="Завершить диалог"),
+    ]
+    await bot.set_my_commands(
+        commands=private_commands,
+        scope=BotCommandScopeAllPrivateChats()
+    )
+
+    # Команды для групп (для админов/саппорта)
+    group_commands = [
+        BotCommand(command="close", description="Закрыть тикет"),
+    ]
+    await bot.set_my_commands(
+        commands=group_commands,
+        scope=BotCommandScopeAllGroupChats()
+    )
+
+async def on_shutdown():
+    print("Бот останавливается...")
+    if pool:
+        await pool.close()
 
 async def main():
     print("Бот запущен...")
     await init_db()
-    await dp.start_polling(bot)
+    await set_commands()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await on_shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
